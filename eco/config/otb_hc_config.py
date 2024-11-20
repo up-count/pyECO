@@ -29,7 +29,7 @@ class OTBHCConfig:
 
     # image sample parameters
     search_area_shape = 'square'        # the shape of the samples
-    search_area_scale = 4.0             # the scaling of the target size to get the search area
+    search_area_scale = 2.0             # the scaling of the target size to get the search area
     min_image_sample_size = 150 ** 2    # minimum area of image samples
     max_image_sample_size = 200 ** 2    # maximum area of image samples
 

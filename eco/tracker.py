@@ -1,32 +1,19 @@
 import numpy as np
-import cv2
-import scipy
-import time
-
-
-from scipy import signal
-# from numpy.fft import fftshift
 
 from .config import config
-from .features import FHogFeature, TableFeature, mround, ResNet50Feature, VGG16Feature
+from .features import mround, ResNet50Feature, DeepHeatmapFeature
 from .fourier_tools import cfft2, interpolate_dft, shift_sample, full_fourier_coeff,\
         cubic_spline_fourier, compact_fourier_coeff, ifft2, fft2, sample_fs
 from .optimize_score import optimize_score
 from .sample_space_model import GMM
 from .train import train_joint, train_filter
-from .scale_filter import ScaleFilter
 
-if config.use_gpu:
-    import cupy as cp
 
 
 class ECOTracker:
-    def __init__(self, is_color):
-        self._is_color = is_color
+    def __init__(self):
         self._frame_num = 0
         self._frames_since_last_train = 0
-        if config.use_gpu:
-            cp.cuda.Device(config.gpu_id).use()
 
     def _cosine_window(self, size):
         """
@@ -34,8 +21,7 @@ class ECOTracker:
         """
         cos_window = np.hanning(int(size[0]+2))[:, np.newaxis].dot(np.hanning(int(size[1]+2))[np.newaxis, :])
         cos_window = cos_window[1:-1, 1:-1][:, :, np.newaxis, np.newaxis].astype(np.float32)
-        if config.use_gpu:
-            cos_window = cp.asarray(cos_window)
+
         return cos_window
 
     def _get_interp_fourier(self, sz):
@@ -43,8 +29,10 @@ class ECOTracker:
             compute the fourier series of the interpolation function.
         """
         f1 = np.arange(-(sz[0]-1) / 2, (sz[0]-1)/2+1, dtype=np.float32)[:, np.newaxis] / sz[0]
+        f1[np.isclose(f1, 0)] = 1e-6
         interp1_fs = np.real(cubic_spline_fourier(f1, config.interp_bicubic_a) / sz[0])
         f2 = np.arange(-(sz[1]-1) / 2, (sz[1]-1)/2+1, dtype=np.float32)[np.newaxis, :] / sz[1]
+        f2[np.isclose(f2, 0)] = 1e-6
         interp2_fs = np.real(cubic_spline_fourier(f2, config.interp_bicubic_a) / sz[1])
         if config.interp_centering:
             f1 = np.arange(-(sz[0]-1) / 2, (sz[0]-1)/2+1, dtype=np.float32)[:, np.newaxis]
@@ -57,12 +45,9 @@ class ECOTracker:
             win2 = np.hanning(sz[1]+2)[np.newaxis, :]
             interp1_fs = interp1_fs * win1[1:-1]
             interp2_fs = interp2_fs * win2[1:-1]
-        if not config.use_gpu:
-            return (interp1_fs[:, :, np.newaxis, np.newaxis],
-                    interp2_fs[:, :, np.newaxis, np.newaxis])
-        else:
-            return (cp.asarray(interp1_fs[:, :, np.newaxis, np.newaxis]),
-                    cp.asarray(interp2_fs[:, :, np.newaxis, np.newaxis]))
+
+        return (interp1_fs[:, :, np.newaxis, np.newaxis],
+                interp2_fs[:, :, np.newaxis, np.newaxis])
 
     def _get_reg_filter(self, sz, target_sz, reg_window_edge):
         """
@@ -99,19 +84,14 @@ class ECOTracker:
         else:
             # else use a scaled identity matrix
             reg_filter = config.reg_window_min
-        if not config.use_gpu:
-            return reg_filter.T
-        else:
-            return cp.asarray(reg_filter.T)
+        return reg_filter.T
+        
 
     def _init_proj_matrix(self, init_sample, compressed_dim, proj_method):
         """
             init the projection matrix
         """
-        if config.use_gpu:
-            xp = cp.get_array_module(init_sample[0])
-        else:
-            xp = np
+        xp = np
         x = [xp.reshape(x, (-1, x.shape[2])) for x in init_sample]
         x = [z - z.mean(0) for z in x]
         proj_matrix_ = []
@@ -128,13 +108,10 @@ class ECOTracker:
         return proj_matrix_
 
     def _proj_sample(self, x, P):
-        if config.use_gpu:
-            xp = cp.get_array_module(x[0])
-        else:
-            xp = np
+        xp = np
         return [xp.matmul(P_.T, x_) for x_, P_ in zip(x, P)]
 
-    def init(self, frame, bbox, total_frame=np.inf):
+    def init(self, frame, decoder_output, bbox, total_frame=np.inf):
         """
             frame -- image
             bbox -- need xmin, ymin, width, height
@@ -142,9 +119,10 @@ class ECOTracker:
         self._pos = np.array([bbox[1]+(bbox[3]-1)/2., bbox[0]+(bbox[2]-1)/2.], dtype=np.float32)
         self._target_sz = np.array([bbox[3], bbox[2]])
         self._num_samples = min(config.num_samples, total_frame)
-        xp = cp if config.use_gpu else np
+        xp = np
 
         # calculate search area and initial scale factor
+        
         search_area = np.prod(self._target_sz * config.search_area_scale)
         if search_area > config.max_image_sample_size:
             self._current_scale_factor = np.sqrt(search_area / config.max_image_sample_size)
@@ -164,48 +142,22 @@ class ECOTracker:
         else:
             raise("unimplemented")
 
-        features = [feature for feature in config.features
-                if ("use_for_color" in feature and feature["use_for_color"] == self._is_color) or
-                    "use_for_color" not in feature]
-
-        self._features = []
-        cnn_feature_idx = -1
-        for idx, feature in enumerate(features):
-            if feature['fname'] == 'cn' or feature['fname'] == 'ic':
-                self._features.append(TableFeature(**feature))
-            elif feature['fname'] == 'fhog':
-                self._features.append(FHogFeature(**feature))
-            elif feature['fname'].startswith('cnn'):
-                cnn_feature_idx = idx
-                netname = feature['fname'].split('-')[1]
-                if netname == 'resnet50':
-                    self._features.append(ResNet50Feature(**feature))
-                elif netname == 'vgg16':
-                    self._features.append(VGG16Feature(**feature))
-            else:
-                raise("unimplemented features")
-        self._features = sorted(self._features, key=lambda x:x.min_cell_size)
-
-        # calculate image sample size
-        if cnn_feature_idx >= 0:
-            self._img_sample_sz = self._features[cnn_feature_idx].init_size(self._img_sample_sz)
-        else:
-            cell_size = [x.min_cell_size for x in self._features]
-            self._img_sample_sz = self._features[0].init_size(self._img_sample_sz, cell_size)
-
-        for idx, feature in enumerate(self._features):
-            if idx != cnn_feature_idx:
-                feature.init_size(self._img_sample_sz)
+        if config.features[0]['fname'] == 'cnn-resnet50':
+            self.feature = ResNet50Feature(**config.features[0])
+        elif config.features[0]['fname'] == 'deep_heatmap':
+            self.feature = DeepHeatmapFeature(**config.features[0])
+ 
+        self._img_sample_sz = self.feature.init_size(self._img_sample_sz, bbox, frame.shape, decoder_output.shape)
 
         if config.use_projection_matrix:
-            sample_dim = [ x for feature in self._features for x in feature._compressed_dim ]
+            sample_dim = self.feature._compressed_dim
         else:
-            sample_dim = [ x for feature in self._features for x in feature.num_dim ]
+            sample_dim = self.feature.num_dim
 
-        feature_dim = [ x for feature in self._features for x in feature.num_dim ]
-
-        feature_sz = np.array([x for feature in self._features for x in feature.data_sz ], dtype=np.int32)
-
+        feature_dim = self.feature.num_dim
+        
+        feature_sz = np.array(self.feature.data_sz, dtype=np.int32)
+        
         # number of fourier coefficients to save for each filter layer, this will be an odd number
         filter_sz = feature_sz + (feature_sz + 1) % 2
 
@@ -235,10 +187,6 @@ class ECOTracker:
         yf_x = [np.sqrt(2 * np.pi) * sig_y[1] / self._output_sz[1] * np.exp(-2 * (np.pi * sig_y[1] * kx_ / self._output_sz[1])**2)
                     for kx_ in self._kx]
         self._yf = [yf_y_.reshape(-1, 1) * yf_x_ for yf_y_, yf_x_ in zip(yf_y, yf_x)]
-        if config.use_gpu:
-            self._yf = [cp.asarray(yf) for yf in self._yf]
-            self._ky = [cp.asarray(ky) for ky in self._ky]
-            self._kx = [cp.asarray(kx) for kx in self._kx]
 
         # construct cosine window
         self._cos_window = [self._cosine_window(feature_sz_) for feature_sz_ in feature_sz]
@@ -253,35 +201,25 @@ class ECOTracker:
 
         # get the reg_window_edge parameter
         reg_window_edge = []
-        for feature in self._features:
-            if hasattr(feature, 'reg_window_edge'):
-                reg_window_edge.append(feature.reg_window_edge)
-            else:
-                reg_window_edge += [config.reg_window_edge for _ in range(len(feature.num_dim))]
+
+        if hasattr(self.feature, 'reg_window_edge'):
+            reg_window_edge.append(self.feature.reg_window_edge)
+        else:
+            reg_window_edge += [config.reg_window_edge for _ in range(len(self.feature.num_dim))]
 
         # construct spatial regularization filter
         self._reg_filter = [self._get_reg_filter(self._img_sample_sz, self._base_target_sz, reg_window_edge_)
                                 for reg_window_edge_ in reg_window_edge]
 
         # compute the energy of the filter (used for preconditioner)
-        if not config.use_gpu:
-            self._reg_energy = [np.real(np.vdot(reg_filter.flatten(), reg_filter.flatten()))
+        self._reg_energy = [np.real(np.vdot(reg_filter.flatten(), reg_filter.flatten()))
                             for reg_filter in self._reg_filter]
-        else:
-            self._reg_energy = [cp.real(cp.vdot(reg_filter.flatten(), reg_filter.flatten()))
-                            for reg_filter in self._reg_filter]
-
-        if config.use_scale_filter:
-            self._scale_filter = ScaleFilter(self._target_sz)
-            self._num_scales = self._scale_filter.num_scales
-            self._scale_step = self._scale_filter.scale_step
-            self._scale_factor = self._scale_filter.scale_factors
-        else:
-            # use the translation filter to estimate the scale
-            self._num_scales = config.number_of_scales
-            self._scale_step = config.scale_step
-            scale_exp = np.arange(-np.floor((self._num_scales-1)/2), np.ceil((self._num_scales-1)/2)+1)
-            self._scale_factor = self._scale_step**scale_exp
+        
+        # use the translation filter to estimate the scale
+        self._num_scales = config.number_of_scales
+        self._scale_step = config.scale_step
+        scale_exp = np.arange(-np.floor((self._num_scales-1)/2), np.ceil((self._num_scales-1)/2)+1)
+        self._scale_factor = self._scale_step**scale_exp
 
         if self._num_scales > 0:
             # force reasonable scale changes
@@ -307,12 +245,8 @@ class ECOTracker:
         self._samplesf = [[]] * self._num_feature_blocks
 
         for i in range(self._num_feature_blocks):
-            if not config.use_gpu:
-                self._samplesf[i] = np.zeros((int(filter_sz[i, 0]), int((filter_sz[i, 1]+1)/2),
+            self._samplesf[i] = np.zeros((int(filter_sz[i, 0]), int((filter_sz[i, 1]+1)/2),
                     sample_dim[i], config.num_samples), dtype=np.complex64)
-            else:
-                self._samplesf[i] = cp.zeros((int(filter_sz[i, 0]), int((filter_sz[i, 1]+1)/2),
-                    sample_dim[i], config.num_samples), dtype=cp.complex64)
 
         # allocate
         self._num_training_samples = 0
@@ -320,11 +254,8 @@ class ECOTracker:
         # extract sample and init projection matrix
         sample_pos = mround(self._pos)
         sample_scale = self._current_scale_factor
-        xl = [x for feature in self._features
-                for x in feature.get_features(frame, sample_pos, self._img_sample_sz, self._current_scale_factor) ]  # get features
 
-        if config.use_gpu:
-            xl = [cp.asarray(x) for x in xl]
+        xl = self.feature.get_features(frame, sample_pos, self._img_sample_sz, self._current_scale_factor, decoder_output)  # get features
 
         xlw = [x * y for x, y in zip(xl, self._cos_window)]                                                          # do windowing
         xlf = [cfft2(x) for x in xlw]                                                                                # fourier series
@@ -332,7 +263,9 @@ class ECOTracker:
         xlf = compact_fourier_coeff(xlf)                                                                             # new sample to be added
         shift_sample_ = 2 * np.pi * (self._pos - sample_pos) / (sample_scale * self._img_sample_sz)
         xlf = shift_sample(xlf, shift_sample_, self._kx, self._ky)
+
         self._proj_matrix = self._init_proj_matrix(xl, sample_dim, config.proj_init_method)
+
         xlf_proj = self._proj_sample(xlf, self._proj_matrix)
         merged_sample, new_sample, merged_sample_id, new_sample_id = \
             self._gmm.update_sample_space_model(self._samplesf, xlf_proj, self._num_training_samples)
@@ -361,6 +294,7 @@ class ECOTracker:
         for i in range(self._num_feature_blocks):
             self._hf[0][i] = xp.zeros((int(filter_sz[i, 0]), int((filter_sz[i, 1]+1)/2),
                 int(sample_dim[i]), 1), dtype=xp.complex64)
+            
 
         if config.update_projection_matrix:
             # init Gauss-Newton optimization of the filter and projection matrix
@@ -387,15 +321,14 @@ class ECOTracker:
                 for i in range(self._num_feature_blocks):
                     new_train_sample_norm += 2 * xp.real(xp.vdot(xlf_proj[i].flatten(), xlf_proj[i].flatten()))
                 self._gmm._gram_matrix[0, 0] = new_train_sample_norm
+
         self._hf_full = full_fourier_coeff(self._hf)
 
-        if config.use_scale_filter and self._num_scales > 0:
-            self._scale_filter.update(frame, self._pos, self._base_target_sz, self._current_scale_factor)
         self._frame_num += 1
 
-    def update(self, frame, train=True, vis=False):
+    def update(self, frame, decoder_output, train=True, vis=False):
         # target localization step
-        xp = cp if config.use_gpu else np
+        xp = np
         pos = self._pos
         old_pos = np.zeros((2))
         for _ in range(config.refinement_iterations):
@@ -405,10 +338,10 @@ class ECOTracker:
                 # extract fatures at multiple resolutions
                 sample_pos = mround(pos)
                 sample_scale = self._current_scale_factor * self._scale_factor
-                xt = [x for feature in self._features
-                        for x in feature.get_features(frame, sample_pos, self._img_sample_sz, sample_scale) ]  # get features
-                if config.use_gpu:
-                    xt = [cp.asarray(x) for x in xt]
+
+                xt = self.feature.get_features(frame, sample_pos, self._img_sample_sz, sample_scale, decoder_output)  # get features
+
+
                 xt_proj = self._proj_sample(xt, self._proj_matrix)                                             # project sample
                 xt_proj = [feat_map_ * cos_window_
                         for feat_map_, cos_window_ in zip(xt_proj, self._cos_window)]                          # do windowing
@@ -431,12 +364,10 @@ class ECOTracker:
 
                 # show score
                 if vis:
-                    if config.use_gpu:
-                       xp = cp
+
                     self.score = xp.fft.fftshift(sample_fs(scores_fs[:,:,scale_idx],
                             tuple((10*self._output_sz).astype(np.uint32))))
-                    if config.use_gpu:
-                       self.score = cp.asnumpy(self.score)
+
                     self.crop_size = self._img_sample_sz * self._current_scale_factor
 
                 # compute the translation vector in pixel-coordinates and round to the cloest integer pixel
@@ -449,11 +380,6 @@ class ECOTracker:
 
                 if config.clamp_position:
                     pos = np.maximum(np.array(0, 0), np.minimum(np.array(frame.shape[:2]), pos))
-
-                # do scale tracking with scale filter
-                if self._num_scales > 0 and config.use_scale_filter:
-                    scale_change_factor = self._scale_filter.track(frame, pos, self._base_target_sz,
-                           self._current_scale_factor)
 
                 # udpate the scale
                 self._current_scale_factor *= scale_change_factor
@@ -513,9 +439,7 @@ class ECOTracker:
             self._frames_since_last_train = 0
         else:
             self._frames_since_last_train += 1
-        if config.use_scale_filter:
-            self._scale_filter.update(frame, pos, self._base_target_sz, self._current_scale_factor)
-
+        
         # udpate the target size
         self._target_sz = self._base_target_sz * self._current_scale_factor
 

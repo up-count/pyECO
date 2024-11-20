@@ -355,6 +355,7 @@ def train_joint(hf, proj_matrix, xlf, yf, reg_filter, sample_energy, reg_energy,
     """
         initial Gauss-Newton optimization of the filter and projection matrix
     """
+
     if config.use_gpu:
         xp = cp.get_array_module(hf[0][0])
     else:
@@ -372,7 +373,8 @@ def train_joint(hf, proj_matrix, xlf, yf, reg_filter, sample_energy, reg_energy,
               config.precond_reg_param * reg_energy_ for m, reg_energy_ in zip(sample_energy, reg_energy)]
     diag_M[1] = [config.precond_proj_param * (m + config.projection_reg) for m in proj_energy]
 
-    rhs_samplef = [[]] * len(hf[0])
+    rhs_samplef = [[]] * len(hf)
+
     # res_norms = []
     for iter_ in range(config.init_GN_iter):
         # project sample with new matrix

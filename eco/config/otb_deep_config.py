@@ -23,12 +23,15 @@ class OTBDeepConfig:
     #              }
 
     cnn_params = {'fname': "cnn-resnet50",
-                  'compressed_dim': [16, 64]
+                  'compressed_dim': [16, 16]
                   }
-    # cnn_params = {'fname': "cnn-vgg16",
-    #               'compressed_dim': [16, 64]
-    #               }
-    features = [fhog_params, cnn_params]
+
+    deep_heatmap = {'fname': 'deep_heatmap',
+                    'compressed_dim': [10],
+                    }
+
+    # features = [cnn_params]
+    features = [deep_heatmap]
 
     # feature parameters
     normalize_power = 2
@@ -38,9 +41,9 @@ class OTBDeepConfig:
 
     # image sample parameters
     search_area_shape = 'square'
-    search_area_scale = 4.5
-    min_image_sample_size = 200 ** 2
-    max_image_sample_size = 250 ** 2
+    search_area_scale = 1.5
+    min_image_sample_size = 10 ** 2
+    max_image_sample_size = 80 ** 2
 
     # detection parameters
     refinement_iterations = 1           # number of iterations used to refine the resulting position in a frame
@@ -50,7 +53,7 @@ class OTBDeepConfig:
     # learning parameters
     output_sigma_factor = 1 / 8.     # label function sigma
     learning_rate = 0.010
-    num_samples = 50
+    num_samples = 50 # TODO: maybe decrease this number
     sample_replace_startegy = 'lowest_prior'
     lt_size = 0
     train_gap = 5
@@ -93,10 +96,10 @@ class OTBDeepConfig:
     interp_windowing = False
 
     # scale parameters
-    number_of_scales = 5
-    scale_step = 1.02# 1.015
     use_scale_filter = False
+    number_of_scales = 1
+    scale_step = 1.02# 1.015
 
     # gpu
-    use_gpu = True
+    use_gpu = False
     gpu_id = 0

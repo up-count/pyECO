@@ -7,6 +7,9 @@ if config.use_gpu:
     code tested no problem
 """
 
+import warnings
+warnings.filterwarnings("ignore")
+
 class GMM:
     def __init__(self, num_samples):
         self._num_samples = num_samples
@@ -108,32 +111,6 @@ class GMM:
             self._distance_matrix[:, id2] = xp.maximum(self._gram_matrix[id2, id2] + xp.diag(self._gram_matrix) - 2 * self._gram_matrix[:, id2], 0)
             self._distance_matrix[id2, :] = self._distance_matrix[:, id2]
             self._distance_matrix[id2, id2] = xp.inf
-
-    # def update_prior_weights(prior_weights, sample_weights, latest_ind, frame_num):
-    #     # udpate the training sample weights
-    #     if frame_num == 1:
-    #         replace_ind = 1
-    #         prior_weights[replace_ind] = 1
-    #     else:
-    #         if config.sample_replace_strategy == 'lowest_prior':
-    #             replace_idx = np.argmin(prior_weights)
-    #         elif config.sample_replace_strategy == 'lowest_weight':
-    #             replace_idx = np.argmin(sample_weights)
-    #         elif config.sample_replace_strategy == 'lowest_median_prior':
-    #             median_prior = np.median(prior_weights)
-    #         elif config.sample_replace_strategy == 'constant_tail':
-    #             idx = np.sort(prior_weights)
-    #             lt_idx = idx[1:config.lt_size]
-    #             st_idx = idx[1:config.lt_size+1:]
-
-    #             minw = np.min(prior_weights[st_idx])
-    #             if minw != 0:
-    #                 lt_mask = np.zeros(prior_weights.shape, dtype=np.uint8)
-    #                 lt_mask[lt_idx] = True
-    #                 lt_mask = lt_mask & (prior_weights > 0)
-    #                 prior_weights[lt_mask] = minw * (1 - config.learning_rate)
-    #         prior_weights = prior_weights / np.sum(prior_weights)
-    #         return prior_weights, replace_idx
 
     def update_sample_space_model(self, samplesf, new_train_sample, num_training_samples):
         if config.use_gpu:
